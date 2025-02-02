@@ -1,12 +1,560 @@
-table1 = {
-    value1 = 1,
-    value2 = 2,
-    value3 = 3
+-- ========== FFI & UI SETUP ==========
+local ffi = require("ffi")
+local ent_c = { get_client_entity = vtable_bind('client.dll', 'VClientEntityList003', 3, 'void*(__thiscall*)(void*, int)') }
+
+ffi.cdef[[
+    typedef struct {
+        char pad_0[0x18];
+        float m_flFeetSpeedForwardsOrSideways;
+        char pad_1C[0xC];
+        float m_flStopToFullRunningFraction;
+        float m_flDuckAmount;
+        char pad_2C[0x74];
+        float m_flMoveWeight;
+        float m_flStrafeWeight;
+        float m_flUnknownVelocityLean;
+        char pad_AC[0x4];
+        float m_flLadderSpeed;
+        char pad_B4[0x4C];
+        float m_flSpeed2D;
+        float m_flUpVelocity;
+        float m_flSpeedNormalized;
+        float m_flFeetSpeedForwardsOrSideways;
+        float m_flFeetSpeedUnknownForwardsOrSideways;
+        float m_flTimeSinceStartedMoving;
+        float m_flTimeSinceStoppedMoving;
+        bool m_bOnGround;
+        bool m_bHitGroundAnimation;
+        char pad_135[0x4];
+        float m_flLastOriginZ;
+        float m_flHeadHeight;
+        float m_flStopToFullRunningFraction;
+        char pad_148[0x8];
+        float m_flLeanYaw;
+        char pad_154[0x8];
+        float m_flPosesSpeed;
+        char pad_160[0x8];
+        float m_flLadderSpeed;
+        char pad_16C[0x8];
+        float m_flLadderYaw;
+        char pad_178[0x8];
+        float m_flBodyYaw;
+        float m_flBodyPitch;
+        char pad_188[0x48];
+        float m_flVelocitySubtractX;
+        float m_flVelocitySubtractY;
+        float m_flVelocitySubtractZ;
+    } animation_state_t;
+
+    typedef struct {
+        char pad_0[0x18];
+        uint32_t m_nSequence;
+        float m_flPrevCycle;
+        float m_flWeight;
+        float m_flWeightDeltaRate;
+        float m_flPlaybackRate;
+        float m_flCycle;
+    } animation_layer_t;
+]]
+
+-- ========== UI CONFIGURATION ==========
+local resolver_master = ui.new_checkbox("RAGE", "Other", "Smart Resolver v2.0", true)
+local resolver_debug = ui.new_checkbox("RAGE", "Other", "Resolver Diagnostics")
+local resolver_mode = ui.new_combobox("RAGE", "Other", "Resolver Mode", {"Precision", "Aggressive"})
+
+-- ========== GLOBAL CONSTANTS ==========
+local RESOLVER_LAYERS = {
+    MOVEMENT = 7,
+    ADJUST = 12,
+    LEAN = 3,
+    JUMP = 4,
+    ALIVELOOP = 8
 }
 
-table2 = {
-    valueA = "A",
-    valueB = "B",
-    valueC = "C"
+local POSE_PARAMS = {
+    BODY_YAW = 11,
+    BODY_PITCH = 12,
+    MOVE_YAW = 15,
+    STAND = 38,
+    CROUCH_AMOUNT = 36
 }
 
+local MOVEMENT_FLAGS = {
+    ON_LADDER = 8,
+    SWIMMING = 9,
+    FL_ONGROUND = 9
+}
+local Records = {}
+local resolver_states = {}
+local hit_miss_data = {}
+
+local last_pitch = {}  -- Stores the last pitch value for each player
+local pitch_history = {}  -- Stores a history of pitch values for each player
+local PITCH_HISTORY_SIZE = 8  -- Number of historical pitch values to track
+local PITCH_CHANGE_THRESHOLD = 45  -- Maximum allowed pitch change before it's considered fake
+local PITCH_FAKE_FLICK_THRESHOLD = 60  -- Threshold for detecting fake flicks
+
+-- ========== CORE UTILITIES ==========
+local function Clamp(value, min, max)
+    return math.min(math.max(value, min), max)
+end
+
+local function NormalizeAngle(angle)
+    angle = angle % 360
+    return angle > 180 and angle - 360 or angle < -180 and angle + 360 or angle
+end
+
+local function VectorAngle(x, y)
+    return math.deg(math.atan2(y, x))
+end
+
+-- ========== ENTITY VALIDATION ==========
+local function IsValidEntity(ent)
+    if not ent or not entity.is_alive(ent) then return false end
+    if entity.get_classname(ent) ~= "CCSPlayer" then return false end
+    
+    local localplayer = entity.get_local_player()
+    return localplayer and entity.is_alive(localplayer) and entity.get_prop(ent, "m_iTeamNum") ~= entity.get_prop(localplayer, "m_iTeamNum")
+end
+
+-- ========== MEMORY ACCESS ==========
+local function SafeAnimstate(ent)
+    local ent_ptr = ent_c.get_client_entity(ent)
+    return ent_ptr ~= ffi.NULL and ffi.cast("animation_state_t*", ffi.cast("char*", ent_ptr) + 0x9960) or nil
+end
+
+local function SafeAnimLayer(ent, layer)
+    local ent_ptr = ent_c.get_client_entity(ent)
+    return ent_ptr ~= ffi.NULL and ffi.cast("animation_layer_t*", ffi.cast('char*', ent_ptr) + 0x2990)[layer] or nil
+end
+
+-- ========== ANIMATION FIXES ==========
+local function FixAnimationLayers(ent)
+    for layer, data in pairs(RESOLVER_LAYERS) do
+        local l = SafeAnimLayer(ent, data)
+        if l then
+            -- Force valid movement layer cycles
+            if layer == "MOVEMENT" and l.m_flCycle > 0.9 then
+                entity.set_prop(ent, "m_flCycle", 0.0, data)
+            end
+            
+            -- Reset invalid adjust layers
+            if layer == "ADJUST" and l.m_flWeight < 0.1 then
+                entity.set_prop(ent, "m_flWeight", 0.0, data)
+            end
+            
+            -- Fix lean layer sequencing
+            if layer == "LEAN" and l.m_nSequence ~= 0 then
+                entity.set_prop(ent, "m_nSequence", 0, data)
+            end
+        end
+    end
+end
+
+-- ========== POSE CORRECTION ==========
+local function CorrectPoseParameters(ent)
+    local state = SafeAnimstate(ent)
+    if not state then return end
+
+    -- Force valid body pitch
+    local pitch = entity.get_prop(ent, "m_angEyeAngles[0]") or 0
+    entity.set_prop(ent, "m_flPoseParameter", Clamp(pitch/180, 0, 1), POSE_PARAMS.BODY_PITCH)
+
+    -- Correct movement yaw
+    local velocity = {entity.get_prop(ent, "m_vecVelocity")}
+    local move_yaw = math.deg(math.atan2(velocity[2], velocity[1]))
+    entity.set_prop(ent, "m_flPoseParameter", (move_yaw % 360) / 360, POSE_PARAMS.MOVE_YAW)
+end
+
+-- ========== MOVEMENT ANALYSIS ==========
+local function GetMoveType(ent)
+    local flags = entity.get_prop(ent, "m_fFlags") or 0
+    return {
+        on_ladder = bit.band(flags, MOVEMENT_FLAGS.ON_LADDER) ~= 0,
+        swimming = bit.band(flags, MOVEMENT_FLAGS.SWIMMING) ~= 0,
+        on_ground = bit.band(flags, MOVEMENT_FLAGS.FL_ONGROUND) ~= 0
+    }
+end
+
+local function ValidateMovement(ent)
+    local move_type = GetMoveType(ent)
+    
+    -- Get velocity safely
+    local raw_vel = entity.get_prop(ent, "m_vecVelocity")
+    local velocity = (type(raw_vel) == "table") and raw_vel or {0, 0, 0}
+    local speed = math.sqrt(velocity[1]^2 + velocity[2]^2)
+
+    -- Get entity flags
+    local flags = entity.get_prop(ent, "m_fFlags") or 0
+    local is_on_ground = bit.band(flags, 1) ~= 0
+
+    -- Detect fake-duck
+    local duck_amount = entity.get_prop(ent, "m_flDuckAmount") or 0
+    if duck_amount > 0.5 and speed < 10 then
+        return "fake-duck"
+    end
+
+    -- Detect slow-walking
+    local anim_speed = SafeAnimstate(ent).m_flFeetSpeedForwardsOrSideways or 0
+    if speed > 5 and speed < 60 and anim_speed < 0.3 and is_on_ground then
+        return "slow-walk"
+    end
+
+    -- Detect fake-walk (if player has high velocity but animation speed is low)
+    if speed > 100 and is_on_ground then
+        if anim_speed < 0.2 then
+            return "fake-walk"
+        end
+    end
+
+    -- Detect jumping
+    if not is_on_ground and velocity[3] > 10 then
+        return "jump"
+    end
+
+    -- Detect falling
+    if not is_on_ground and velocity[3] < -10 then
+        return "fall"
+    end
+
+    -- Detect ladder movement
+    if move_type == 9 then
+        return "ladder"
+    end
+
+    -- Detect noclip movement
+    if move_type == 8 then
+        return "noclip"
+    end
+
+    return "normal"
+end
+
+
+-- ========== VELOCITY PREDICTION ==========
+local function PredictAdjustedVelocity(ent)
+    local velocity = {entity.get_prop(ent, "m_vecVelocity")}
+    local flags = entity.get_prop(ent, "m_fFlags") or 0
+    local on_ground = bit.band(flags, 1) ~= 0
+
+    -- Apply gravity
+    if not on_ground then
+        velocity[3] = velocity[3] - (globals.tickinterval() * 800)
+    end
+
+    -- Apply surface friction
+    if on_ground then
+        local speed = math.sqrt(velocity[1]^2 + velocity[2]^2)
+        velocity[1] = velocity[1] * (speed > 5 and 0.92 or 1.0)
+        velocity[2] = velocity[2] * (speed > 5 and 0.92 or 1.0)
+    end
+
+    return velocity
+end
+
+-- ========== AIM MATRIX SYSTEM ==========
+local function BuildAimMatrix(ent)
+    local matrix = {
+        head = { angle = 0, weight = 0.6 },
+        chest = { angle = 0, weight = 0.3 },
+        legs = { angle = 0, weight = 0.1 }
+    }
+
+    local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]") or 0
+    local body_yaw = (entity.get_prop(ent, "m_flPoseParameter", 11) or 0) * 120 - 60
+    local velocity = PredictAdjustedVelocity(ent)
+
+    matrix.head.angle = eye_yaw + (body_yaw * 0.3)
+    matrix.chest.angle = body_yaw + (eye_yaw * 0.15)
+    matrix.legs.angle = math.deg(math.atan2(velocity[2], velocity[1]))
+
+    return matrix
+end
+
+-- ========== LBY UPDATE SYSTEM ==========
+local function DetectLBYUpdates(ent)
+    local last_update = entity.get_prop(ent, "m_flSimulationTime") or 0
+    local velocity = {entity.get_prop(ent, "m_vecVelocity")}
+    local speed = math.sqrt(velocity[1]^2 + velocity[2]^2)
+    local update_interval = speed > 0.1 and 0.22 or 1.1
+
+    return (globals.curtime() - last_update) >= update_interval
+end
+
+-- ========== BRUTEFORCE SYSTEM ==========
+local function ApplyBruteforce(ent)
+    -- Ensure data exists
+    if not hit_miss_data[ent] then
+        hit_miss_data[ent] = {hits = 0, misses = 0, last_angle = 0}
+    end
+
+    local miss_count = hit_miss_data[ent].misses or 0
+    local random_factor = math.random(-5, 5)  -- Adds slight randomness to avoid predictability
+    local step_size = 15 + (miss_count * 3)   -- Gradually increases per miss
+    local max_brute_angle = 90                -- Max brute-force angle limit
+
+    -- Ensure last_angle exists
+    local last_angle = hit_miss_data[ent].last_angle or 0
+
+    -- Adaptive angle selection
+    local new_angle = last_angle + step_size
+    if math.abs(new_angle) > max_brute_angle then
+        new_angle = -max_brute_angle  -- Reset if it exceeds the max brute-force range
+    end
+
+    hit_miss_data[ent].last_angle = new_angle
+    return new_angle + random_factor  -- Apply randomization
+end
+
+
+
+-- ========== ML PATTERN SYSTEM ==========
+local ML_DATA = {
+    players = {},
+    weights = { desync = 0.4, movement = 0.3, weapon = 0.2, history = 0.1 },
+    max_samples = 128,
+    decay_time = 45
+}
+
+
+local function ExtractFeatures(ent)
+    return {
+        desync = math.abs(NormalizeAngle(
+            entity.get_prop(ent, "m_angEyeAngles[1]") - 
+            ((entity.get_prop(ent, "m_flPoseParameter", 11) or 0) * 120 - 60)
+        )),
+        speed = math.sqrt((entity.get_prop(ent, "m_vecVelocity") or 0)^2 + (entity.get_prop(ent, "m_vecVelocity[1]") or 0)^2),
+        weapon = entity.get_prop(entity.get_prop(ent, "m_hActiveWeapon"), "m_iItemDefinitionIndex") or 0,
+        duck = entity.get_prop(ent, "m_flDuckAmount") or 0
+    }
+end
+
+-- ========== ANTI FAKE FLICK ==========
+local previous_yaw = {}
+
+local function NormalizeAngle_fakeflick(angle)
+    while angle > 180 do angle = angle - 360 end
+    while angle < -180 do angle = angle + 360 end
+    return angle
+end
+
+local function DetectFakeFlick(ent)
+    local current_yaw = entity.get_prop(ent, "m_angEyeAngles[1]") or 0
+
+    if previous_yaw[ent] then
+        local yaw_change = math.abs(NormalizeAngle_fakeflick(current_yaw - previous_yaw[ent]))
+
+        if yaw_change > 80 then
+            return previous_yaw[ent]  -- Use last known valid yaw
+        end
+    end
+
+    previous_yaw[ent] = current_yaw
+    return current_yaw
+end
+
+-- ========== UTILITY FUNCTIONS ==========
+local function CalculatePitchAverage(ent)
+    if not pitch_history[ent] or #pitch_history[ent] == 0 then
+        return 0
+    end
+    local sum = 0
+    for _, pitch in ipairs(pitch_history[ent]) do
+        sum = sum + pitch
+    end
+    return sum / #pitch_history[ent]
+end
+
+local function DetectPitchPattern(ent, current_pitch)
+    if not pitch_history[ent] or #pitch_history[ent] < PITCH_HISTORY_SIZE then
+        return false
+    end
+
+    -- Check for repeated flicking patterns
+    local flick_count = 0
+    for i = 2, #pitch_history[ent] do
+        local delta = math.abs(pitch_history[ent][i] - pitch_history[ent][i - 1])
+        if delta > PITCH_FAKE_FLICK_THRESHOLD then
+            flick_count = flick_count + 1
+        end
+    end
+
+    -- If more than half of the recent changes are flicks, assume it's a pattern
+    return flick_count > (#pitch_history[ent] / 2)
+end
+
+-- ========== PITCH RESOLUTION ==========
+local function ResolvePitch(ent)
+    -- Get the current pitch from the entity's eye angles
+    local eye_pitch = entity.get_prop(ent, "m_angEyeAngles[0]") or 0
+
+    -- Initialize pitch history for the entity if it doesn't exist
+    if not pitch_history[ent] then
+        pitch_history[ent] = {}
+    end
+
+    -- Add the current pitch to the history
+    table.insert(pitch_history[ent], eye_pitch)
+    if #pitch_history[ent] > PITCH_HISTORY_SIZE then
+        table.remove(pitch_history[ent], 1)
+    end
+
+    -- Calculate the average pitch from history
+    local average_pitch = CalculatePitchAverage(ent)
+
+    -- Detect if the player is moving or jumping
+    local velocity = {entity.get_prop(ent, "m_vecVelocity")}
+    local speed = math.sqrt(velocity[1]^2 + velocity[2]^2)
+    local is_moving = speed > 0.1
+    local is_on_ground = bit.band(entity.get_prop(ent, "m_fFlags"), 1) ~= 0
+
+    -- Detect fake pitch changes
+    local pitch_delta = math.abs(eye_pitch - (last_pitch[ent] or eye_pitch))
+    local is_fake_pitch = false
+
+    -- Check for sudden pitch changes
+    if pitch_delta > PITCH_CHANGE_THRESHOLD then
+        -- If the player is stationary, sudden pitch changes are likely fake
+        if not is_moving and is_on_ground then
+            is_fake_pitch = true
+        end
+
+        -- If a pitch pattern is detected, assume it's fake
+        if DetectPitchPattern(ent, eye_pitch) then
+            is_fake_pitch = true
+        end
+    end
+
+    -- Determine the final pitch value
+    local final_pitch = eye_pitch
+    if is_fake_pitch then
+        -- Use the historical average if the current pitch is fake
+        final_pitch = average_pitch
+    end
+
+    -- Store the current pitch for future comparisons
+    last_pitch[ent] = final_pitch
+
+    return final_pitch
+end
+
+
+-- ========== RESOLVER CORE (UPDATED FOR PITCH) ==========
+local function AdvancedResolver(ent)
+    FixAnimationLayers(ent)
+    CorrectPoseParameters(ent)
+    
+    -- Existing yaw resolution calculations
+    local raw_vel = entity.get_prop(ent, "m_vecVelocity")
+    local velocity = (type(raw_vel) == "table") and raw_vel or {0, 0, 0}
+    local speed = math.sqrt(velocity[1]^2 + velocity[2]^2)
+    local is_moving = speed > 0.1
+    local is_on_ground = bit.band(entity.get_prop(ent, "m_fFlags"), 1) ~= 0
+    
+    local move_state = ValidateMovement(ent)
+    local lby_update = DetectLBYUpdates(ent)
+    local aim_matrix = BuildAimMatrix(ent)
+    local features = ExtractFeatures(ent)
+
+    -- Yaw resolution (existing logic)
+    local total_weight = aim_matrix.head.weight + aim_matrix.chest.weight + aim_matrix.legs.weight
+    local base_angle = (aim_matrix.head.angle * aim_matrix.head.weight +
+                        aim_matrix.chest.angle * aim_matrix.chest.weight +
+                        aim_matrix.legs.angle * aim_matrix.legs.weight) / total_weight
+
+    -- Mode-based adjustments
+    local mode = ui.get(resolver_mode)
+    if mode == "Aggressive" then
+        base_angle = base_angle * 1.2  -- Bias toward higher angles
+    elseif mode == "Precision" then
+        base_angle = aim_matrix.legs.angle  -- Trust leg movement more
+    end
+
+    -- Dynamic desync scaling
+    local desync = math.abs(features.desync)
+    if desync > 30 then
+        local desync_factor = math.min(desync / 60, 1.0)
+        base_angle = base_angle + (features.desync * 0.3 * desync_factor)
+    end
+
+    -- LBY update logic
+    if lby_update then
+        if is_moving then
+            base_angle = entity.get_prop(ent, "m_flLowerBodyYawTarget") or base_angle
+        else
+            base_angle = (DetectFakeFlick(ent) or base_angle) * 0.7 + 
+                         (entity.get_prop(ent, "m_flLowerBodyYawTarget") or base_angle) * 0.3
+        end
+    end
+
+    -- Bruteforce after 2+ misses
+    if hit_miss_data[ent] and hit_miss_data[ent].misses >= 2 then
+        base_angle = ApplyBruteforce(ent)
+    end
+
+    -- Adaptive clamping for yaw
+    local clamp_max = is_on_ground and 60 or 180
+    local final_yaw = Clamp(NormalizeAngle(base_angle), -clamp_max, clamp_max)
+
+    -- Resolve pitch using the improved logic
+    local final_pitch = ResolvePitch(ent)
+
+    -- Debug info: Print everything on a single line
+    if ui.get(resolver_debug) then
+        local player_name = entity.get_player_name(ent) or "Unknown"
+        print(string.format(
+            "[Resolver] Player: %s | State: %s | LBY: %s | Yaw: %.1f° | Pitch: %.1f° | Brute: %d", 
+            player_name, move_state, lby_update and "UPDATE" or "STABLE", final_yaw, final_pitch, brute_idx or 0
+        ))
+    end    
+
+    -- Return both yaw and pitch
+    return final_yaw, final_pitch
+end
+
+-- ========== EVENT HANDLERS (UPDATED FOR PITCH) ==========
+client.set_event_callback("net_update_start", function()
+    if not ui.get(resolver_master) then return end
+    
+    local players = entity.get_players(true)
+    for _, ent in ipairs(players) do
+        if IsValidEntity(ent) and not entity.is_dormant(ent) then
+            local resolved_yaw, resolved_pitch = AdvancedResolver(ent)
+
+            -- Set resolved yaw
+            plist.set(ent, "Force body yaw value", resolved_yaw)
+            plist.set(ent, "Force body yaw", true)
+
+            -- Set resolved pitch
+            plist.set(ent, "Force pitch value", resolved_pitch)
+            plist.set(ent, "Force pitch", true)
+        end
+    end
+end)
+
+client.set_event_callback("player_hurt", function(e)
+    local ent = client.userid_to_entindex(e.userid)
+    if ent and IsValidEntity(ent) then
+        hit_miss_data[ent] = hit_miss_data[ent] or {hits = 0, misses = 0, last_angle = 0}
+        hit_miss_data[ent].hits = hit_miss_data[ent].hits + 1
+        hit_miss_data[ent].misses = math.max(hit_miss_data[ent].misses - 1, 0)  -- Reduce miss count on hit
+    end
+end)
+
+
+client.set_event_callback("weapon_fire", function(e)
+    client.delay_call(0.15, function()
+        local ent = client.userid_to_entindex(e.userid)
+        if ent and IsValidEntity(ent) then
+            hit_miss_data[ent] = hit_miss_data[ent] or {hits = 0, misses = 0}
+            hit_miss_data[ent].misses = hit_miss_data[ent].misses + 1
+        end
+    end)
+end)
+
+client.set_event_callback("shutdown", function()
+	for i = 1, 64 do
+		plist.set(i, "Force body yaw", false)
+        plist.set(i, "Force pitch", false)
+	end
+end)

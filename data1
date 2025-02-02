@@ -1,0 +1,12 @@
+table1 = {
+    value1 = 1,
+    value2 = 2,
+    value3 = 3
+}
+
+table2 = {
+    valueA = "A",
+    valueB = "B",
+    valueC = "C"
+}
+
